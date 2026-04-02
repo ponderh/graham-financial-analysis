@@ -152,6 +152,20 @@ PB           2.34     2.81        4/8    中等
 python3 scripts/send_feishu.py "<open_id>" "<报告摘要>"
 ```
 
+**生成PDF（可选）：**
+```bash
+python3 scripts/report_to_pdf.py <报告.md> [输出.pdf]
+# 例如：python3 scripts/report_to_pdf.py FINAL_ANALYSIS_REPORT.md
+# 自动从报告第一行提取标题，生成封面+精美排版PDF
+```
+
+生成的PDF特性：
+- 自动封面（深色背景+标题+股票代码+日期）
+- 评分数字自动着色（绿/黄/红）
+- Red Flag警示框自动高亮
+- 支持表格/列表/粗体等Markdown语法
+- A4标准排版，适合打印存档
+
 ## 各估值方法详解
 
 ### ① Graham Number（格雷厄姆数）

@@ -748,7 +748,7 @@ def detect_key_warnings(text, text_lower, parsed_data):
     if guarantee:
         gt_text = guarantee.get('text', '')
         # 检查是否有大额担保
-       担保_amounts = re.findall(r'([\d,，.]+)\s*(?:亿|万)\s*(?:元)?', gt_text)
+        担保_amounts = re.findall(r'([\d,，.]+)\s*(?:亿|万)\s*(?:元)?', gt_text)
         if 担保_amounts:
             try:
                 max_amt = max(float(a.replace(',','').replace('，','')) for a in 担保_amounts)
@@ -778,7 +778,7 @@ def detect_key_warnings(text, text_lower, parsed_data):
         warnings.append({
             'type': '⚠️ 警示',
             'item': '存在会计政策或估计变更',
-            'detail': policy_change.get('text', '')[:200            })
+            'detail': policy_change.get('text', '')[:200]            })
     
     # ── 5. 在建工程长期不转固 ──
     balance = fs.get('balance', {})

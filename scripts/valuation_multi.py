@@ -230,12 +230,13 @@ def load_financial_data(stock_code, data_dir):
             df = df.sort_values('日期', ascending=False)
             latest = df.iloc[0]
             
-            data['eps'] = float(latest.get('摊薄每股收益', latest.get('加权EPS', 0)))
-            data['bps'] = float(latest.get('每股净资产', 0))
-            data['roe'] = float(latest.get('净资产收益率(%)', latest.get('加权ROE', 0))) / 100
-            data['net_margin'] = float(latest.get('销售净利率', 0)) / 100
-            data['gross_margin'] = float(latest.get('销售毛利率', 0)) / 100
-            data['debt_ratio'] = float(latest.get('资产负债率', 0)) / 100
+            eps_col = '摊薄每股收益(元)'
+            data['eps'] = float(latest.get(eps_col, latest.get('摊薄每股收益', 0)))
+            data['bps'] = float(latest.get('每股净资产_调整后(元)', latest.get('每股净资产_调整前(元)', 0)))
+            data['roe'] = float(latest.get('净资产收益率(%)', 0)) / 100
+            data['net_margin'] = float(latest.get('销售净利率(%)', 0)) / 100
+            data['gross_margin'] = float(latest.get('销售毛利率(%)', 0)) / 100
+            data['debt_ratio'] = float(latest.get('资产负债率(%)', 0)) / 100
             
             # 净现比（经营CF/净利润）
             cashflow_df = pd.read_csv(cashflow_file) if os.path.exists(cashflow_file) else None
@@ -339,7 +340,7 @@ def main(stock_code, data_dir="."):
     if buffett_iv:
         results['Buffett IV'] = {'low': buffett_iv * 0.8, 'mid': buffett_iv, 'high': buffett_iv * 1.2, 'value': buffett_iv}
         buffett_pct = (current_price / buffett_iv - 1) * 100
-        print(f"   内在价值: {buffett_iv:.2f}元（假设增速{rowth_est*100:.1f}%） | 当前价溢价: {buffett_pct:+.1f}%")
+        print(f"   内在价值: {buffett_iv:.2f}元（假设增速{growth_est*100:.1f}%） | 当前价溢价: {buffett_pct:+.1f}%")
     print()
     
     # ── ④ DCF ──
