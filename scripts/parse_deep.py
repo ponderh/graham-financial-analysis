@@ -424,17 +424,20 @@ def analyze_valuation_dim(data_dir: str, stock_code: str) -> Dict:
             result['valuation_verdict'] = f'极度低估（{avg_ratio:.1f}x）'
             result['recommendation'] = '强烈买入'
 
-    # PE水位判断
+    # PE水位判断（独立于估值方法综合判断）
     if result['pe']:
         pe = result['pe']
         if pe > 100:
-            result['pe_verdict'] = '🔴 P/E极度偏高（市盈率无参考意义，盈利不稳定）'
+            result['pe_verdict'] = f'🔴 P/E={pe:.0f}x 极度高估（盈利质量无法支撑此估值）'
+            result['verdict_level'] = max(result['verdict_level'], 5)
+            result['recommendation'] = '卖出'
         elif pe > 60:
-            result['pe_verdict'] = f'🟠 P/E极高（{pe:.0f}x），需高增长支撑'
+            result['pe_verdict'] = f'🟠 P/E={pe:.0f}x 极高（需高增长才能消化估值）'
+            result['verdict_level'] = max(result['verdict_level'], 4)
         elif pe > 30:
-            result['pe_verdict'] = f'🟡 P/E偏高（{pe:.0f}x）'
+            result['pe_verdict'] = f'🟡 P/E={pe:.0f}x 偏高'
         elif pe > 0:
-            result['pe_verdict'] = f'🟢 P/E合理（{pe:.0f}x）'
+            result['pe_verdict'] = f'🟢 P/E={pe:.0f}x 合理'
 
     # 加载同行比较
     peer_file = os.path.join(data_dir, f'peer_comparison_{stock_code}.json')
@@ -460,6 +463,240 @@ def analyze_valuation_dim(data_dir: str, stock_code: str) -> Dict:
         ]
 
     return result
+
+# ─────────────────────────────────────────
+# 多年盈利质量分析（v5新增）
+# ─────────────────────────────────────────
+
+def analyze_earnings_quality(data_dir: str) -> Dict:
+    """
+    多年度盈利质量深度分析
+    1. 现金流质量（净现比趋势）
+    2. 应收款项质量（应收账款天数趋势）
+    3. 收入质量（经营现金流/营收趋势）
+    4. Dupont ROE分解
+    5. 运营杠杆
+    """
+    fi = os.path.join(data_dir, 'financial_indicator_annual.csv')
+    if not os.path.exists(fi):
+        return {'available': False}
+
+    try:
+        import pandas as pd
+        df = pd.read_csv(fi)
+        df = df.sort_values('日期').reset_index(drop=True)
+    except Exception:
+        return {'available': False}
+
+    years = [str(r)[:4] for r in df['日期']]
+
+    def safe(col):
+        return [float(v) if pd.notna(v) else None for v in df[col]]
+
+    # 原始指标
+    ocf_ratio = safe('经营现金净流量对销售收入比率(%)')
+    net_profit = safe('经营现金净流量与净利润的比率(%)')
+    ar_days = safe('应收账款周转天数(天)')
+    inv_days = safe('存货周转天数(天)')
+    roe = safe('净资产收益率(%)')
+    net_margin = safe('销售净利率(%)')
+    asset_turn = safe('总资产周转率(次)')
+    equity_ratio = safe('股东权益比率(%)')
+    three_fee = safe('三项费用比重')
+    revenue = safe('主营业务收入增长率(%)')
+
+    # Dupont分解：ROE = 净利率 × 资产周转率 × 权益乘数
+    dupont_analysis = []
+    for i in range(len(df)):
+        nm = net_margin[i]
+        at = asset_turn[i]
+        er = equity_ratio[i]
+        if nm is not None and at is not None and er is not None and er > 0:
+            equity_mult = 100 / er
+            roe_dp = (nm / 100) * at * equity_mult * 100
+            profit_contrib = nm / 100
+            turnover_contrib = at
+        else:
+            roe_dp, profit_contrib, turnover_contrib = [None]*3
+            equity_mult = None
+        dupont_analysis.append({
+            'year': years[i],
+            'roe': round(roe_dp, 2) if roe_dp else None,
+            'profit_margin_contrib': round(profit_contrib * 100, 2) if profit_contrib else None,
+            'asset_turn_contrib': round(turnover_contrib, 3) if turnover_contrib else None,
+            'equity_multiplier': round(equity_mult, 2) if equity_mult else None,
+        })
+
+    # 运营杠杆
+    op_leverage = []
+    for i in range(len(df)):
+        fee = three_fee[i]
+        rev_g = revenue[i]
+        if fee is not None and rev_g is not None:
+            if fee > 40 and rev_g < 15:
+                verdict = '⚠️ 负向运营杠杆（费用率高+增速放缓）'
+                signal = -1
+            elif fee < 38 and rev_g and rev_g > 15:
+                verdict = '✅ 正向运营杠杆（费用率下降+高速增长）'
+                signal = 1
+            else:
+                verdict = '中性'
+                signal = 0
+            op_leverage.append({'verdict': verdict, 'signal': signal, 'fee_rate': round(fee,1), 'rev_growth': round(rev_g,1)})
+        else:
+            op_leverage.append({'verdict': '数据不足', 'signal': 0})
+
+    # 应收款质量
+    ar_signals = []
+    for i in range(len(df)):
+        days = ar_days[i]
+        if days is not None:
+            if days > 90:
+                ar_signals.append('🔴 应收款>90天，回款风险高')
+            elif days > 60:
+                ar_signals.append('🟡 应收款60-90天，需关注')
+            else:
+                ar_signals.append('✅ 应收款周转正常')
+        else:
+            ar_signals.append('数据不足')
+
+    # 盈利质量综合评分
+    quality_scores = []
+    for i in range(len(df)):
+        score = 5
+        ncf = net_profit[i] if i < len(net_profit) else None
+        if ncf is not None:
+            if ncf > 1: score += 1
+            elif ncf < 0: score -= 2
+        if ar_days[i] and ar_days[i] > 60: score -= 1
+        if ar_days[i] and ar_days[i] > 90: score -= 1
+        if roe[i] and roe[i] < 5: score -= 1
+        if roe[i] and roe[i] > 15: score += 1
+        quality_scores.append(max(1, min(10, score)))
+
+    return {
+        'available': True,
+        'years': years,
+        'dupont': dupont_analysis,
+        'metrics': {
+            'ocf_to_revenue': ocf_ratio,
+            'net_cf_ratio': net_profit,
+            'ar_days': ar_days,
+            'inv_days': inv_days,
+            'roe': roe,
+            'net_margin': net_margin,
+            'three_fee': three_fee,
+            'revenue_growth': revenue,
+        },
+        'signals': {
+            'ar_days_verdict': ar_signals,
+            'op_leverage': op_leverage,
+            'quality_scores': quality_scores,
+        },
+    }
+
+
+# ─────────────────────────────────────────
+# 管理层承诺兑现分析（v5新增）
+# ─────────────────────────────────────────
+
+def analyze_promise_vs_fulfillment(board_reports: Dict) -> Dict:
+    """
+    董事会报告年度对比：承诺 vs 兑现
+    从各年董事会报告中提取管理层的经营目标承诺
+    在次年报告中核查是否兑现
+    """
+    result = {
+        'available': False,
+        'promises': {},
+        'fulfillment': {},
+        'promise_count': 0,
+        'fulfillment_rate': 0,
+        'verdict': '',
+    }
+
+    if not board_reports:
+        return result
+
+    sorted_keys = sorted(board_reports.keys())
+    if len(sorted_keys) < 2:
+        return result
+
+    result['available'] = True
+
+    quant_kws = [
+        r'增长\s*[到至]?\s*(\d+(?:\.\d+)?)%',
+        r'(\d+(?:\.\d+)?)\s*%\s*增长',
+        r'收入\s*[到至]?\s*(\d+[,，]?\d*)\s*(?:万|亿)',
+        r'净利润\s*[到至]?\s*(\d+[,，]?\d*)\s*(?:万|亿)',
+    ]
+
+    all_promises = {}
+    for key in sorted_keys:
+        br = board_reports.get(key, {})
+        pts = br.get('key_points', [])
+        promises = []
+        for pt in pts:
+            if any(kw in pt for kw in ['计划', '目标', '预计', '努力', '争取']):
+                quant_found = False
+                for qpat in quant_kws:
+                    m = re.search(qpat, pt)
+                    if m:
+                        promises.append({
+                            'source': key, 'text': pt,
+                            'quant_target': m.group(0), 'fulfilled': None,
+                        })
+                        quant_found = True
+                        break
+                if not quant_found:
+                    promises.append({
+                        'source': key, 'text': pt,
+                        'quant_target': None, 'fulfilled': None,
+                    })
+        all_promises[key] = promises
+        result['promise_count'] += len(promises)
+
+    result['promises'] = {k: [{'text': p['text'], 'quant': p['quant_target']} for p in v]
+                           for k, v in all_promises.items()}
+
+    fulfill_kws = ['已实现', '已完成', '达成', '超额完成', '圆满完成', '如期']
+    fail_kws = ['未完成', '未能', '未达', '低于', '不及']
+
+    for i in range(len(sorted_keys) - 1):
+        curr_key = sorted_keys[i]
+        next_key = sorted_keys[i + 1]
+        curr_promises = all_promises.get(curr_key, [])
+        next_pts = board_reports.get(next_key, {}).get('key_points', [])
+        next_text = ' '.join(next_pts)
+
+        for p in curr_promises:
+            if p['quant_target']:
+                num_m = re.search(r'\d+(?:\.\d+)?', p['quant_target'])
+                if num_m:
+                    num_str = num_m.group(0)
+                    if any(kw in next_text for kw in fulfill_kws) and num_str in next_text:
+                        p['fulfilled'] = '✅'
+                    elif any(kw in next_text for kw in fail_kws) and num_str in next_text:
+                        p['fulfilled'] = '❌'
+                    else:
+                        p['fulfilled'] = '❓'
+
+    fulfilled = sum(1 for pts in all_promises.values() for p in pts if p['fulfilled'] == '✅')
+    failed = sum(1 for pts in all_promises.values() for p in pts if p['fulfilled'] == '❌')
+    total = fulfilled + failed
+    if total > 0:
+        result['fulfillment_rate'] = round(fulfilled / total * 100, 0)
+        result['verdict'] = f'承诺兑现率：{fulfilled}/{total}={result["fulfillment_rate"]:.0f}%'
+    else:
+        result['verdict'] = '无足够历史数据验证承诺兑现'
+
+    result['fulfillment'] = {
+        k: [{'text': p['text'], 'status': p['fulfilled']} for p in v]
+        for k, v in all_promises.items()
+    }
+
+    return result
+
 
 
 # ─────────────────────────────────────────
@@ -1267,6 +1504,12 @@ def synthesize(stock_code: str, results: List[Dict],
     # 加载财务趋势
     trends = load_financial_trends(data_dir or output_dir, stock_code)
 
+    # 加载盈利质量分析（v5新增）
+    earnings_quality = analyze_earnings_quality(data_dir or output_dir)
+
+    # 管理层承诺兑现分析（v5新增）
+    promise_analysis = analyze_promise_vs_fulfillment(board_reports)
+
     # 最终推荐（综合专家分 + 估值）
     if valuation.get('available') and valuation.get('verdict_level', 0) > 0:
         # 估值高估/极度高估 → 降低推荐
@@ -1323,7 +1566,8 @@ def synthesize(stock_code: str, results: List[Dict],
             'pe_verdict': valuation.get('pe_verdict', ''),
             'peer_percentile': valuation.get('peer_percentile', {}),
         },
-        'financial_trends': None,
+        'earnings_quality': None,  # v5新增
+        'promise_analysis': None,  # v5新增
         'decision': {
             'recommendation': recommendation,
             'final_score': round(final_score, 1),
@@ -1346,6 +1590,8 @@ def synthesize(stock_code: str, results: List[Dict],
             'net_cf_ratio': trends['net_cf_ratio'],
             'signals': sig,
         }
+    synthesis['earnings_quality'] = earnings_quality if earnings_quality.get('available') else None
+    synthesis['promise_analysis'] = promise_analysis if promise_analysis.get('available') else None
 
     # 多空逻辑汇总
     for r in results:
@@ -1358,6 +1604,33 @@ def synthesize(stock_code: str, results: List[Dict],
                 synthesis['decision']['bear_case'].append(hr.get('hidden_truth', '')[:100])
         if r['expert'] == 'Critic' and r.get('ignored'):
             synthesis['decision']['bear_case'].extend([x for x in r['ignored'][:2]])
+
+    # 管理质量信号（来自承诺兑现分析）
+    if promise_analysis and promise_analysis.get('available'):
+        if promise_analysis.get('fulfillment_rate', 0) >= 80:
+            synthesis['decision']['bull_case'].append(
+                f"管理层承诺兑现率{promise_analysis['fulfillment_rate']:.0f}%（>80%），执行力强 ✅"
+            )
+        elif promise_analysis.get('fulfillment_rate', 0) < 50:
+            synthesis['decision']['bear_case'].append(
+                f"管理层承诺兑现率{promise_analysis['fulfillment_rate']:.0f}%（<50%），执行力弱 ⚠️"
+            )
+
+    # 盈利质量信号
+    if earnings_quality and earnings_quality.get('available'):
+        eq = earnings_quality
+        yrs = eq['years']
+        qs = eq['signals'].get('quality_scores', [])
+        if qs:
+            latest_q = qs[-1] if qs else 5
+            if latest_q >= 7:
+                synthesis['decision']['bull_case'].append(
+                    f"盈利质量评分{latest_q}/10（优秀），现金流健康 ✅"
+                )
+            elif latest_q <= 4:
+                synthesis['decision']['bear_case'].append(
+                    f"盈利质量评分{latest_q}/10（偏差），现金流质量存疑 ⚠️"
+                )
 
     # 催化剂（从董事会报告推断）
     for key, br in board_reports.items():
