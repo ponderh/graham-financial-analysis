@@ -219,12 +219,23 @@ def fetch_all_exchange_reports(stock_code, report_type='all'):
         szse_reports = fetch_szse_reports(stock_code, report_type)
         all_reports.extend(szse_reports)
         print(f"  深交所找到 {len(szse_reports)} 份报告")
+        
+        # 【关键修复】深交所股票用公司名搜索补充
+        # CNINFO对部分SZSE股票的stockCode过滤有bug（实测300986返回港股数据）
+        # 用searchkey=公司名替代stockCode可绕过此bug
+        company_reports = _fetch_by_company_name(stock_code, report_type)
+        all_reports.extend(company_reports)
+        
     else:
         # 上交所（包含科创板688/787）
         print("📡 查询上交所...")
         sse_reports = fetch_sse_reports(stock_code, report_type)
         all_reports.extend(sse_reports)
         print(f"  上交所找到 {len(sse_reports)} 份报告")
+        
+        # 上交所股票也用公司名搜索补充（双重保障）
+        company_reports = _fetch_by_company_name(stock_code, report_type)
+        all_reports.extend(company_reports)
         
         # 科创板同时查一下是否有补充披露
         if is_kechuang_board(stock_code):
@@ -243,6 +254,123 @@ def fetch_all_exchange_reports(stock_code, report_type='all'):
     # 按日期排序（最新优先）
     unique.sort(key=lambda x: x.get('publishDate', ''), reverse=True)
     
+    return unique
+
+
+def _fetch_by_company_name(stock_code, report_type='all'):
+    """
+    【核心修复】通过公司名搜索绕过CNINFO stockCode过滤bug
+    
+    发现：CNINFO的hisAnnouncement/query接口对部分股票（特别是SZSE创业板
+    300/002/000开头）在传入stockCode时返回港股/无关数据。
+    解决：用searchkey=公司名替代stockCode，可以绕过此过滤bug。
+    实测：300986用stockCode搜索返回港股，用"志特新材 年度报告"搜索才能找到A股年报。
+    """
+    all_reports = []
+    
+    # 先用akshare获取公司名
+    company_name = None
+    try:
+        import akshare as ak
+        info = ak.stock_individual_info_em(symbol=stock_code)
+        for _, row in info.iterrows():
+            if '股票名称' in str(row.get('item', '')):
+                company_name = str(row.get('value', ''))
+                break
+        if not company_name:
+            for _, row in info.iterrows():
+                v = str(row.get('value', ''))
+                if v and not v.isdigit() and len(v) >= 4:
+                    company_name = v
+                    break
+    except Exception:
+        pass
+    
+    if not company_name:
+        print(f"  ⚠️ 无法获取公司名，跳过公司名搜索")
+        return []
+    
+    print(f"📡 用公司名'{company_name}'搜索...")
+    
+    # 用公司名作为searchkey搜索
+    keywords = []
+    if report_type in ('all', 'annual'):
+        keywords.extend([f"{company_name} 年度报告", f"{company_name} 年度报告摘要"])
+    if report_type in ('all', 'half'):
+        keywords.extend([f"{company_name} 半年度报告", f"{company_name} 半年度报告摘要"])
+    if report_type in ('all', 'quarterly'):
+        keywords.extend([f"{company_name} 一季度报告", f"{company_name} 三季度报告"])
+    
+    for keyword in keywords:
+        payload = {
+            'stockCode': '', 'orgId': '', 'category': '',
+            'searchkey': keyword,
+            'secid': '', 'plate': '', 'trade': '',
+            'seDate': '', 'pageNum': '1', 'pageSize': '20',
+            'tabName': 'fulltext', 'column': '',
+        }
+        
+        try:
+            resp = requests.post(
+                'http://www.cninfo.com.cn/new/hisAnnouncement/query',
+                data=payload,
+                headers={
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+                    'Accept': 'application/json',
+                    'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                    'Origin': 'http://www.cninfo.com.cn',
+                    'Referer': 'http://www.cninfo.com.cn/',
+                },
+                timeout=15
+            )
+            result = resp.json()
+            announcements = result.get('announcements', [])
+            
+            for ann in announcements:
+                sec_code = ann.get('secCode', '')
+                # 严格匹配股票代码
+                if sec_code != stock_code:
+                    continue
+                
+                title = ann.get('announcementTitle', '')
+                ann_id = ann.get('announcementId', '')
+                adjunct = ann.get('adjunctUrl', '')
+                publish_time = ann.get('publishTime', '')
+                
+                if not adjunct or not adjunct.endswith('.PDF'):
+                    continue
+                
+                if isinstance(publish_time, (int, float)):
+                    publish_time = datetime.fromtimestamp(publish_time/1000).strftime('%Y-%m-%d')
+                
+                pdf_url = 'http://static.cninfo.com.cn/' + adjunct
+                
+                all_reports.append({
+                    'title': title,
+                    'announcementId': ann_id,
+                    'publishDate': publish_time,
+                    'pdfUrl': pdf_url,
+                    'category': '年报' if '年度' in title else ('半年报' if '半年度' in title else '季报'),
+                    'exchange': 'CNINFO',
+                    'stockCode': stock_code,
+                    'source': 'company_name_search',
+                })
+        
+        except Exception as e:
+            print(f"  ⚠️ 搜索'{keyword[:20]}'失败: {e}")
+        
+        time.sleep(0.3)
+    
+    # 去重
+    seen = set()
+    unique = []
+    for r in all_reports:
+        key = r.get('announcementId', '')
+        if key and key not in seen:
+            seen.add(key)
+            unique.append(r)
+    
+    print(f"  公司名搜索找到 {len(unique)} 份报告")
     return unique
 
 
