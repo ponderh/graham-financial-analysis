@@ -260,6 +260,26 @@ def load_financial_data(stock_code, data_dir):
         if '日期' in price_df.columns:
             price_df = price_df.sort_values('日期', ascending=False)
             data['current_price'] = float(price_df.iloc[0].get('收盘', 0))
+    else:
+        # fallback：实时获取当前价格
+        import akshare as ak
+        try:
+            bid_df = ak.stock_bid_ask_em(symbol=stock_code)
+            if bid_df is not None and not bid_df.empty:
+                latest = bid_df[bid_df['item'] == '最新']['value']
+                if len(latest) > 0:
+                    data['current_price'] = float(latest.values[0])
+                    print(f"  ⚠️ price_history.csv缺失，使用实时价格: {data['current_price']:.2f}元")
+        except Exception as e:
+            print(f"  ⚠️ 实时价格获取失败: {e}")
+        if 'current_price' not in data:
+            try:
+                hist = ak.stock_zh_a_hist(symbol=stock_code, start_date='20260101', adjust='qfq')
+                if hist is not None and len(hist) > 0:
+                    data['current_price'] = float(hist.iloc[-1]['收盘'])
+                    print(f"  ⚠️ price_history.csv缺失，使用历史最新收盘: {data['current_price']:.2f}元")
+            except Exception as e2:
+                print(f"  ⚠️ 历史价格获取也失败: {e2}")
     
     # 估算FCF（经营CF近似，用3年平均）
     if os.path.exists(cashflow_file):

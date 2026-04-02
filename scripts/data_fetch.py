@@ -60,10 +60,29 @@ def fetch_all(stock_code, output_dir):
 
     # 6. 股价历史（前复权）
     print("  [6/6] 股价历史...")
-    price = ak.stock_zh_a_hist(symbol=stock_code, start_date='20220101', 
-                                end_date='20251231', adjust='qfq')
-    price.to_csv(f'{output_dir}/price_history.csv', index=False, encoding='utf-8-sig')
-    print(f"  ✅ 股价历史: {len(price)} rows")
+    try:
+        price = ak.stock_zh_a_hist(symbol=stock_code, start_date='20220101',
+                                    end_date='20251231', adjust='qfq')
+        price.to_csv(f'{output_dir}/price_history.csv', index=False, encoding='utf-8-sig')
+        print(f"  ✅ 股价历史: {len(price)} rows")
+    except Exception as e:
+        print(f"  ⚠️ 股价历史获取失败: {e}")
+        # fallback：尝试获取最新价格
+        try:
+            import pdfplumber, os
+            # 用pdfplumber尝试从最近年报获取当前股价
+            print("  ℹ️ 尝试从实时接口获取最新价格...")
+            bid_df = ak.stock_bid_ask_em(symbol=stock_code)
+            latest_price = bid_df[bid_df['item'] == '最新']['value'].values[0]
+            # 生成单行price_history.csv
+            from datetime import datetime
+            with open(f'{output_dir}/price_history.csv', 'w') as f:
+                f.write(f"日期,股票代码,开盘,收盘,最高,最低,成交量,成交额,振幅,涨跌幅,涨跌额,换手率\n")
+                today = datetime.now().strftime('%Y-%m-%d')
+                f.write(f"{today},{stock_code},,,{latest_price},,,,,,,,\n")
+            print(f"  ✅ 使用实时价格 {latest_price:.2f} 元生成price_history.csv")
+        except Exception as e2:
+            print(f"  ❌ 实时价格获取也失败: {e2}")
 
     print(f"\n✅ 数据采集完成！文件保存在: {output_dir}/")
 
