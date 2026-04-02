@@ -217,6 +217,252 @@ def load_graham_data(data_dir: str, stock_code: str) -> Dict:
 
 
 # ─────────────────────────────────────────
+# 三年财务趋势分析（新增模块）
+# ─────────────────────────────────────────
+
+def load_financial_trends(data_dir: str, stock_code: str) -> Optional[Dict]:
+    """
+    加载多年财务数据，计算趋势指标
+    返回：{
+        years: [2022, 2023, 2024, 2025],
+        metrics: {eps: [...], roe: [...], ...},
+        trends: {revenue_yoy: [...], net_profit_yoy: [...], ...},
+        signals: {...}
+    }
+    """
+    fi_annual = os.path.join(data_dir, 'financial_indicator_annual.csv')
+    if not os.path.exists(fi_annual):
+        return None
+
+    try:
+        import pandas as pd
+        df = pd.read_csv(fi_annual)
+        df = df.sort_values('日期').reset_index(drop=True)
+    except Exception:
+        return None
+
+    years = [str(r)[:4] for r in df['日期']]
+
+    # 提取关键指标（处理NaN）
+    def safe(col):
+        return [float(v) if pd.notna(v) else None for v in df[col]]
+
+    metrics = {
+        'eps': safe('摊薄每股收益(元)'),
+        'roe': safe('净资产收益率(%)'),
+        'net_margin': safe('销售净利率(%)'),
+        'gross_margin': safe('销售毛利率(%)'),
+        'debt_ratio': safe('资产负债率(%)'),
+        'ocf_per_share': safe('每股经营性现金流(元)'),
+        'bps': safe('每股净资产_调整后(元)'),
+        'revenue_growth': safe('主营业务收入增长率(%)'),
+        'profit_growth': safe('净利润增长率(%)'),
+    }
+
+    # 计算YoY变化
+    def yoy(vals):
+        result = []
+        for i, v in enumerate(vals):
+            if i == 0 or v is None or vals[i-1] is None or vals[i-1] == 0:
+                result.append(None)
+            else:
+                result.append(round((v - vals[i-1]) / abs(vals[i-1]) * 100, 1))
+        return result
+
+    # 净现比
+    net_cf_ratio = []
+    for i in range(len(df)):
+        eps = metrics['eps'][i]
+        ocf = metrics['ocf_per_share'][i]
+        if eps and eps > 0 and ocf is not None:
+            net_cf_ratio.append(round(ocf / eps, 2))
+        else:
+            net_cf_ratio.append(None)
+
+    # 趋势方向判断
+    def trend(vals):
+        valid = [v for v in vals if v is not None]
+        if len(valid) < 2:
+            return '→'
+        first, last = valid[0], valid[-1]
+        if last > first * 1.1:
+            return '↗'
+        elif last < first * 0.9:
+            return '↘'
+        return '→'
+
+    signals = {}
+    roe_vals = [v for v in metrics['roe'] if v is not None]
+    if roe_vals:
+        signals['roe_trend'] = trend(metrics['roe'])
+        signals['roe_latest'] = roe_vals[-1]
+    net_margin_vals = [v for v in metrics['net_margin'] if v is not None]
+    if net_margin_vals:
+        signals['net_margin_trend'] = trend(metrics['net_margin'])
+        signals['net_margin_latest'] = net_margin_vals[-1]
+    debt_vals = [v for v in metrics['debt_ratio'] if v is not None]
+    if debt_vals:
+        signals['debt_trend'] = trend(debt_vals)
+        signals['debt_latest'] = debt_vals[-1]
+        signals['debt_high'] = debt_vals[-1] > 60
+    ncf_vals = [v for v in net_cf_ratio if v is not None]
+    if ncf_vals:
+        signals['cash_quality'] = '✅ 净现比>1' if ncf_vals[-1] > 1 else '⚠️ 净现比<1'
+        signals['cash_quality_score'] = ncf_vals[-1]
+
+    ocf_vals = [v for v in metrics['ocf_per_share'] if v is not None]
+    if ocf_vals:
+        signals['ocf_trend'] = trend(metrics['ocf_per_share'])
+        signals['ocf_latest'] = ocf_vals[-1]
+
+    return {
+        'years': years,
+        'metrics': metrics,
+        'yoy': {
+            'revenue': yoy([df['主营业务收入增长率(%)'].iloc[i] if pd.notna(df['主营业务收入增长率(%)'].iloc[i]) else None for i in range(len(df))]),
+            'profit': yoy([df['净利润增长率(%)'].iloc[i] if pd.notna(df['净利润增长率(%)'].iloc[i]) else None for i in range(len(df))]),
+        },
+        'net_cf_ratio': net_cf_ratio,
+        'signals': signals,
+    }
+
+
+# ─────────────────────────────────────────
+# 估值维度分析（新增模块）
+# ─────────────────────────────────────────
+
+def analyze_valuation_dim(data_dir: str, stock_code: str) -> Dict:
+    """
+    整合估值数据 + 同行比较 → 估值水位判断
+    """
+    result = {
+        'available': False,
+        'current_price': None,
+        'pe': None,
+        'pb': None,
+        'roe': None,
+        'valuation_methods': {},
+        'valuation_verdict': '',
+        'verdict_level': 0,  # -2极度低估 ~ +5极度高估
+        'peer_percentile': {},
+        'recommendation': '',
+        'buy_conditions': [],
+        'sell_conditions': [],
+        'catalysts': [],
+    }
+
+    # 加载估值JSON
+    val_files = glob.glob(os.path.join(data_dir, f'valuation_multi_{stock_code}*.json'))
+    if not val_files:
+        return result
+
+    try:
+        with open(max(val_files, key=os.path.getmtime)) as f:
+            val = json.load(f)
+    except Exception:
+        return result
+
+    result['available'] = True
+    result['current_price'] = val.get('current_price')
+    km = val.get('key_metrics', {})
+    eps = km.get('eps')
+    bps = km.get('bps')
+    if result['current_price'] and eps and eps > 0:
+        result['pe'] = round(result['current_price'] / eps, 1)
+    if result['current_price'] and bps and bps > 0:
+        result['pb'] = round(result['current_price'] / bps, 2)
+    result['roe'] = km.get('roe')
+
+    # 整合各估值方法结果
+    val_methods = val.get('valuations', {})
+    current_price = result['current_price']
+    method_verdicts = {}
+
+    for method_name, v in val_methods.items():
+        if not isinstance(v, dict):
+            continue
+        intrinsic = v.get('value', 0)
+        if not intrinsic or intrinsic <= 0:
+            continue
+        ratio = current_price / intrinsic if current_price else None
+        result['valuation_methods'][method_name] = {
+            'intrinsic': round(intrinsic, 2),
+            'ratio': round(ratio, 2) if ratio else None,
+            'low': round(v.get('low', 0), 2),
+            'high': round(v.get('high', 0), 2),
+        }
+        if ratio is not None:
+            method_verdicts[method_name] = ratio
+
+    # 综合判断
+    if method_verdicts:
+        avg_ratio = sum(method_verdicts.values()) / len(method_verdicts)
+        result['avg_price_to_intrinsic'] = round(avg_ratio, 2)
+
+        if avg_ratio > 5:
+            result['verdict_level'] = 5
+            result['valuation_verdict'] = f'极度高估（当前价是内在价值约{avg_ratio:.0f}倍）'
+            result['recommendation'] = '卖出'
+        elif avg_ratio > 3:
+            result['verdict_level'] = 4
+            result['valuation_verdict'] = f'显著高估（{avg_ratio:.1f}x）'
+            result['recommendation'] = '卖出'
+        elif avg_ratio > 1.5:
+            result['verdict_level'] = 3
+            result['valuation_verdict'] = f'偏高估（{avg_ratio:.1f}x）'
+            result['recommendation'] = '回避'
+        elif avg_ratio > 0.9:
+            result['verdict_level'] = 2
+            result['valuation_verdict'] = f'合理偏高（{avg_ratio:.1f}x）'
+            result['recommendation'] = '观望'
+        elif avg_ratio > 0.5:
+            result['verdict_level'] = 0
+            result['valuation_verdict'] = f'低估（{avg_ratio:.1f}x）'
+            result['recommendation'] = '关注'
+        else:
+            result['verdict_level'] = -1
+            result['valuation_verdict'] = f'极度低估（{avg_ratio:.1f}x）'
+            result['recommendation'] = '强烈买入'
+
+    # PE水位判断
+    if result['pe']:
+        pe = result['pe']
+        if pe > 100:
+            result['pe_verdict'] = '🔴 P/E极度偏高（市盈率无参考意义，盈利不稳定）'
+        elif pe > 60:
+            result['pe_verdict'] = f'🟠 P/E极高（{pe:.0f}x），需高增长支撑'
+        elif pe > 30:
+            result['pe_verdict'] = f'🟡 P/E偏高（{pe:.0f}x）'
+        elif pe > 0:
+            result['pe_verdict'] = f'🟢 P/E合理（{pe:.0f}x）'
+
+    # 加载同行比较
+    peer_file = os.path.join(data_dir, f'peer_comparison_{stock_code}.json')
+    if os.path.exists(peer_file):
+        try:
+            with open(peer_file) as f:
+                peer = json.load(f)
+            result['peer_percentile'] = peer.get('percentile_rankings', {})
+            tm = peer.get('target_metrics', {})
+            if tm:
+                result['peer_pe'] = tm.get('pe')
+        except Exception:
+            pass
+
+    # 买卖条件
+    if result['pe'] and eps:
+        result['buy_conditions'] = [
+            f'PE降至30x以下（目标价：{round(30*eps, 1)}元）',
+            f'PE降至20x以下（目标价：{round(20*eps, 1)}元）',
+        ]
+        result['sell_conditions'] = [
+            f'PE超过100x（风险极高）或浮盈超过50%止盈',
+        ]
+
+    return result
+
+
+# ─────────────────────────────────────────
 # Graham专家
 # ─────────────────────────────────────────
 
@@ -997,10 +1243,45 @@ def run_experts(texts: Dict, stock_code: str, output_dir: str,
 
 
 def synthesize(stock_code: str, results: List[Dict],
-               board_reports: Dict, output_dir: str) -> Dict:
+               board_reports: Dict, output_dir: str,
+               data_dir: str = None) -> Dict:
+    """
+    综合四位专家结果 + 估值维度 + 财务趋势 → 最终决策
+    评分权重：Graham×0.35, Marks×0.30, Critic×0.20, Buffett×0.15
+    """
+    # 专家评分
     scores = [r['score'] for r in results if r and 'score' in r]
-    avg = sum(scores) / len(scores) if scores else 5
-    recs = list({r.get('final_recommendation','观望') for r in results if r})
+    weights = {'Graham': 0.35, 'Buffett': 0.15, 'Marks': 0.30, 'Critic': 0.20}
+    weighted_sum = 0
+    for r in results:
+        if r and 'score' in r:
+            w = weights.get(r['expert'], 0.25)
+            weighted_sum += r['score'] * w
+
+    avg = sum(scores) / len(scores) if scores else 5  # 简单平均兜底
+    composite = round(weighted_sum, 1)
+
+    # 加载估值维度
+    valuation = analyze_valuation_dim(data_dir or output_dir, stock_code)
+
+    # 加载财务趋势
+    trends = load_financial_trends(data_dir or output_dir, stock_code)
+
+    # 最终推荐（综合专家分 + 估值）
+    if valuation.get('available') and valuation.get('verdict_level', 0) > 0:
+        # 估值高估/极度高估 → 降低推荐
+        adjustment = valuation['verdict_level'] * 0.3
+        final_score = max(1, composite - adjustment)
+    elif valuation.get('verdict_level', 0) < 0:
+        final_score = min(10, composite + 0.5)
+    else:
+        final_score = composite
+
+    if final_score < 4: recommendation = '强烈回避'
+    elif final_score < 5: recommendation = '回避'
+    elif final_score < 6: recommendation = '观望'
+    elif final_score < 7: recommendation = '关注'
+    else: recommendation = '买入'
 
     synthesis = {
         'meta': {
@@ -1008,24 +1289,82 @@ def synthesize(stock_code: str, results: List[Dict],
             'date': datetime.now().strftime('%Y-%m-%d'),
             'experts': [r['expert'] for r in results if r],
             'board_reports': list(board_reports.keys()),
+            'data_sources': {
+                'pdf_annual': True,
+                'valuation': valuation.get('available', False),
+                'financial_trends': trends is not None,
+            }
         },
         'individual': {
             r['expert']: {
                 'score': r.get('score'),
                 'assessment': r.get('final_assessment',''),
-                'risks': (r.get('risk_signals',[]) + r.get('hidden_risks',[]))[:3],
+                'risks': (r.get('risk_signals',[]) + [x.get('hidden_truth','') for x in r.get('hidden_risks',[])])[:3],
                 'positive': r.get('positive_signals',[])[:3],
             } for r in results if r
         },
         'board_reports': board_reports,
-        'scores': {'composite': round(avg,1), 'range': f"{min(scores)}-{max(scores)}" if scores else '?'},
+        'scores': {
+            'composite': round(avg, 1),
+            'weighted': round(composite, 1),
+            'final': round(final_score, 1),
+            'range': f"{min(scores)}-{max(scores)}" if scores else '?',
+            'weights_used': weights,
+        },
+        'valuation': {
+            'current_price': valuation.get('current_price'),
+            'pe': valuation.get('pe'),
+            'pb': valuation.get('pb'),
+            'roe': valuation.get('roe'),
+            'verdict': valuation.get('valuation_verdict', ''),
+            'verdict_level': valuation.get('verdict_level', 0),
+            'avg_ratio': valuation.get('avg_price_to_intrinsic'),
+            'methods': valuation.get('valuation_methods', {}),
+            'pe_verdict': valuation.get('pe_verdict', ''),
+            'peer_percentile': valuation.get('peer_percentile', {}),
+        },
+        'financial_trends': None,
+        'decision': {
+            'recommendation': recommendation,
+            'final_score': round(final_score, 1),
+            'buy_conditions': valuation.get('buy_conditions', []),
+            'sell_conditions': valuation.get('sell_conditions', []),
+            'catalysts': [],  # 来自董事会报告/公告的催化剂
+            'bull_case': [],   # 买入逻辑
+            'bear_case': [],   # 卖出逻辑
+        },
     }
 
-    if avg < 4: synthesis['recommendation'] = '强烈回避'
-    elif avg < 5.5: synthesis['recommendation'] = '回避'
-    elif avg < 6.5: synthesis['recommendation'] = '观望'
-    elif avg < 7.5: synthesis['recommendation'] = '关注'
-    else: synthesis['recommendation'] = '买入'
+    # 财务趋势摘要
+    if trends:
+        sig = trends.get('signals', {})
+        synthesis['financial_trends'] = {
+            'years': trends['years'],
+            'eps': trends['metrics']['eps'],
+            'roe': trends['metrics']['roe'],
+            'net_margin': trends['metrics']['net_margin'],
+            'net_cf_ratio': trends['net_cf_ratio'],
+            'signals': sig,
+        }
+
+    # 多空逻辑汇总
+    for r in results:
+        if not r:
+            continue
+        if r['expert'] == 'Buffett' and r.get('positive_signals'):
+            synthesis['decision']['bull_case'].extend(r['positive_signals'][:2])
+        if r['expert'] == 'Marks' and r.get('hidden_risks'):
+            for hr in r['hidden_risks'][:3]:
+                synthesis['decision']['bear_case'].append(hr.get('hidden_truth', '')[:100])
+        if r['expert'] == 'Critic' and r.get('ignored'):
+            synthesis['decision']['bear_case'].extend([x for x in r['ignored'][:2]])
+
+    # 催化剂（从董事会报告推断）
+    for key, br in board_reports.items():
+        pts = br.get('key_points', [])
+        for p in pts:
+            if any(kw in p for kw in ['临床', '获批', '注册', '新品', '中标']):
+                synthesis['decision']['catalysts'].append(p)
 
     with open(os.path.join(output_dir, f"{stock_code}_deep_v2_report.json"), 'w') as f:
         json.dump(synthesis, f, ensure_ascii=False, indent=2)
@@ -1046,58 +1385,104 @@ def main(stock_code: str, output_dir: str, experts: List[str] = None,
         if graham_data.get('available'):
             print(f"\n📊 格雷厄姆skill数据：{', '.join(graham_data['available'])}")
 
+    # ── 多年PDF扫描 ──
     pdfs = find_pdfs(pdf_dir)
     if not pdfs:
         print(f"❌ 未找到PDF: {pdf_dir}")
         return
 
-    annual = pdfs.get('年度报告', list(pdfs.values())[0])
-    size_mb = os.path.getsize(annual) / 1024 / 1024
-    print(f"\n📄 年报: {os.path.basename(annual)} ({size_mb:.1f} MB)")
+    # ── 扫描所有可用年份的所有PDF ──
+    # 重新找所有PDF（不限年份）
+    all_annual_pdfs = sorted(
+        glob.glob(os.path.join(pdf_dir, '*年年度报告.pdf')),
+        key=os.path.getmtime, reverse=True
+    )
+    all_texts = {}  # {年份: {关键词: [上下文...]}}
+    pdf_years = {}  # {年份: 路径}
 
-    # 一次性PDF扫描
-    all_kws = []
-    for kws in CHAPTER_KEYWORDS.values():
-        all_kws.extend(kws)
+    for pdf_path in all_annual_pdfs:
+        ym = re.search(r'(20\d{2})', pdf_path)
+        year = ym.group(1) if ym else 'unknown'
+        if year in all_texts:
+            continue  # 已扫描过该年份，跳过
+        size_mb = os.path.getsize(pdf_path) / 1024 / 1024
+        print(f"\n📄 [{year}年度报告] {os.path.basename(pdf_path)} ({size_mb:.1f} MB)")
+        all_kws = []
+        for kws in CHAPTER_KEYWORDS.values():
+            all_kws.extend(kws)
+        texts = extract_chapter_text(pdf_path, 'all', all_kws, max_pages=120)
+        total = sum(len(v) for v in texts.values())
+        print(f"  ✅ {total}命中，{len(texts)}章节")
+        if texts:
+            all_texts[year] = texts
+            pdf_years[year] = pdf_path
+
+    # 也扫描半年报/季报（如果有）
+    other_types = {
+        '半年度报告': glob.glob(os.path.join(pdf_dir, '*年半年度报告.pdf')),
+        '第一季度报告': glob.glob(os.path.join(pdf_dir, '*第一季度报告.pdf')),
+        '第三季度报告': glob.glob(os.path.join(pdf_dir, '*第三季度报告.pdf')),
+    }
+    for rtype, files in other_types.items():
+        for pdf_path in sorted(files, key=os.path.getmtime, reverse=True)[:1]:  # 每类最多1份
+            ym = re.search(r'(20\d{2})', pdf_path)
+            year = ym.group(1) if ym else 'unknown'
+            if year in all_texts:
+                continue
+            size_mb = os.path.getsize(pdf_path) / 1024 / 1024
+            print(f"\n📄 [{year}{rtype}] {os.path.basename(pdf_path)} ({size_mb:.1f} MB)")
+            all_kws = []
+            for kws in CHAPTER_KEYWORDS.values():
+                all_kws.extend(kws)
+            texts = extract_chapter_text(pdf_path, 'all', all_kws, max_pages=80)
+            total = sum(len(v) for v in texts.values())
+            print(f"  ✅ {total}命中，{len(texts)}章节")
+            if texts:
+                all_texts[year] = texts
+                pdf_years[year] = pdf_path
+
+    if not all_texts:
+        print("❌ 没有成功解析任何PDF")
+        return
+
+    # 用最新年份做四专家分析
+    latest_year = max(all_texts.keys())
+    texts = all_texts[latest_year]
+
     print(f"\n{'='*50}")
-    print(f"🎯 深度年报解析 v2.0 — {stock_code}")
+    print(f"🎯 深度年报解析 v3.0 — {stock_code}（共扫描{len(all_texts)}个财报）")
     print(f"{'='*50}")
-    print("  📖 一次性PDF预扫描...")
-    texts = extract_chapter_text(annual, 'all', all_kws, max_pages=120)
-    total = sum(len(v) for v in texts.values())
-    print(f"  ✅ {total}命中，{len(texts)}章节")
 
-    # 董事会报告追踪
-    print(f"\n📋 董事会报告追踪")
+    # 董事会报告追踪（从多年PDF提取）
+    print(f"\n📋 董事会报告追踪（{len(all_texts)}年）")
     board_reports = {}
-    for rtype, path in pdfs.items():
-        try:
-            kws = CHAPTER_KEYWORDS['board_report']
-            br = {kw: texts.get(kw, []) for kw in kws if kw in texts}
-            if br and any(br[kw] for kw in kws):
-                full = merge_texts(br)
-                ym = re.search(r'(20\d{2})', path)
-                year = ym.group(1) if ym else '?'
-                key = f"{year}-{rtype}"
-                board_reports[key] = {
-                    'file': os.path.basename(path),
-                    'pages': sorted(set(t['page'] for kw in br for t in br[kw])),
-                    'key_points': _key_points(full),
-                }
-                print(f"  {key}: {len(board_reports[key]['key_points'])}个要点")
-        except Exception as e:
-            print(f"  {rtype}: 失败 {e}")
+    year_to_rtype = {v: k for k, v in pdf_years.items()}  # 文件路径→年份
+    for year, year_texts in sorted(all_texts.items()):
+        kws = CHAPTER_KEYWORDS['board_report']
+        br = {kw: year_texts.get(kw, []) for kw in kws if kw in year_texts}
+        if br and any(br[kw] for kw in kws):
+            full = merge_texts(br)
+            key = f"{year}-年度报告"
+            board_reports[key] = {
+                'file': os.path.basename(pdf_years.get(year, '')),
+                'pages': sorted(set(t['page'] for kw in br for t in br[kw])),
+                'key_points': _key_points(full),
+            }
+            print(f"  {key}: {len(board_reports[key]['key_points'])}个要点")
 
-    # 四专家
+    # 四专家（用最新年份PDF）
     results = run_experts(texts, stock_code, output_dir, graham_data)
 
     if results:
-        s = synthesize(stock_code, results, board_reports, output_dir)
+        s = synthesize(stock_code, results, board_reports, output_dir, data_dir)
         print(f"\n{'='*50}")
         for r in results:
             print(f"  {r['expert']:10s}: {r.get('score','?'):4.1f}/10  {r.get('final_assessment','')[:70]}")
         print(f"{'='*50}")
-        print(f"  综合: {s['scores']['composite']}/10  建议: {s['recommendation']}")
+        val = s.get('valuation', {})
+        if val.get('available'):
+            print(f"  💰 估值: PE={val.get('pe','?')}x  |  {val.get('verdict','?')}")
+        print(f"  综合: {s['scores']['final']}/10  建议: {s['decision']['recommendation']}")
         print(f"{'='*50}")
         if board_reports:
             print(f"\n📋 董事会报告要点：")
@@ -1106,6 +1491,14 @@ def main(stock_code: str, output_dir: str, experts: List[str] = None,
                 print(f"  [{key}] ({len(pts)}个)")
                 for p in pts[:3]:
                     print(f"    • {p[:80]}")
+        # 决策摘要
+        dec = s.get('decision', {})
+        if dec:
+            print(f"\n📊 决策条件：")
+            for cond in dec.get('buy_conditions', [])[:2]:
+                print(f"  🟢 买入条件: {cond}")
+            for cond in dec.get('sell_conditions', [])[:2]:
+                print(f"  🔴 卖出条件: {cond}")
 
     print(f"\n✅ 完成！结果: {output_dir}/")
 
